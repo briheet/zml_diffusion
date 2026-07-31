@@ -55,3 +55,15 @@ nix run .#cudazimage -- \
   --seqlen=512 \
   --output=/workspace/cinematic-cat-1024.png
 ```
+
+## Benchmark
+
+RTX 5090, 1024×1024, 48 steps; model loading excluded:
+
+| Implementation | Generation + PNG |
+|---|---:|
+| ZML | 35.091s |
+| Diffusers | 40.645s |
+
+ZML was **1.16× faster** in this run. See the
+[Diffusers benchmark](others/diffusers/zimage/README.md) for its command.
