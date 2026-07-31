@@ -1,5 +1,14 @@
 # ZML Diffusion
 
+## Tested Environment
+
+- RunPod image: `runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404-cluster`
+- Pod: `a9dk3g7cny`
+- GPU: 1× NVIDIA RTX 5090
+- CPU: 21 vCPUs (AMD EPYC 9354)
+- Memory: 125 GB
+- Container disk: 50 GB
+
 ## Install Nix on Ubuntu
 
 ```bash
@@ -25,7 +34,15 @@ nix flake --help
 
 ## Run
 
-Generate an image with Z-Image on an NVIDIA Linux machine:
+Download the model:
+
+```bash
+HF_XET_HIGH_PERFORMANCE=1 \
+  uvx --from huggingface-hub hf download Tongyi-MAI/Z-Image \
+  --local-dir /workspace/models/Z-Image
+```
+
+Generate an image on an NVIDIA Linux machine:
 
 ```bash
 nix run .#cudazimage -- \
