@@ -5,3 +5,12 @@ common --incompatible_disallow_empty_glob=false
 common --@rules_zig//zig/settings:use_cc_common_link=true
 common --@rules_zig//zig/settings:use_standalone_translate_c=true
 common --@rules_zig//zig/settings:zigopt=-fllvm
+
+common:release --compilation_mode=opt
+common:release --copt=-Ofast
+common:release --strip=always
+common:release --@rules_zig//zig/settings:mode=release_safe
+
+common:cudazimage --config=release
+common:cudazimage --@zml//platforms:cuda=true
+common:cudazimage --@zml//platforms:cpu=false

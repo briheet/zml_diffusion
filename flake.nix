@@ -99,12 +99,35 @@
         }
       );
 
-      apps = forAllSystems (system: {
-        default = {
-          type = "app";
-          program = "${self.packages.${system}.default}/bin/zml_diffusion";
-        };
-      });
+      apps = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          cudaZImage = pkgs.writeShellApplication {
+            name = "cudazimage";
+            runtimeInputs = [ pkgs.bazelisk ];
+            text = ''
+              if [[ ! -f MODULE.bazel ]]; then
+                echo "Run this command from the zml_diffusion repository." >&2
+                exit 1
+              fi
+
+              exec bazelisk run --config=cudazimage //:zml_diffusion -- "$@"
+            '';
+          };
+        in
+        {
+          default = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/zml_diffusion";
+          };
+
+          cudazimage = {
+            type = "app";
+            program = "${cudaZImage}/bin/cudazimage";
+          };
+        }
+      );
 
       devShells = forAllSystems (
         system:
