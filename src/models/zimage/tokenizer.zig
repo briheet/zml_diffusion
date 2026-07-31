@@ -47,6 +47,7 @@ const ConfigOverrides = struct {
 pub const PromptEncoding = struct {
     ids: zml.Slice,
     mask: zml.Slice,
+    token_count: u32,
 
     pub fn deinit(self: *PromptEncoding, allocator: std.mem.Allocator) void {
         self.ids.free(allocator);
@@ -205,6 +206,7 @@ pub const Tokenizer = struct {
         return .{
             .ids = ids,
             .mask = mask,
+            .token_count = @intCast(prompt_tokens.len),
         };
     }
 

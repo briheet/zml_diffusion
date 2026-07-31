@@ -243,21 +243,34 @@ pub const Transformer = struct {
         image: zml.Tensor,
         t: zml.Tensor,
         cap_feat: zml.Tensor,
+        cap_token_count: zml.Tensor,
+        cap_aligned_length: zml.Tensor,
         patch_size: u32,
         f_patch_size: u32,
     ) zml.Tensor {
         std.debug.assert(patch_size == self.all_patch_size[0]);
         std.debug.assert(f_patch_size == self.all_f_patch_size[0]);
+        std.debug.assert(image.shape().hasTags(.{ .b, .c, .f, .h, .w }));
+        std.debug.assert(t.shape().hasTags(.{.b}));
+        std.debug.assert(cap_feat.shape().hasTags(.{ .b, .s, .d }));
+        std.debug.assert(cap_token_count.shape().hasTags(.{.b}));
+        std.debug.assert(cap_aligned_length.shape().hasTags(.{.b}));
+        std.debug.assert(image.dim(.b) == t.dim(.b));
+        std.debug.assert(image.dim(.b) == cap_feat.dim(.b));
+        std.debug.assert(image.dim(.b) == cap_token_count.dim(.b));
+        std.debug.assert(image.dim(.b) == cap_aligned_length.dim(.b));
         const size = ImageSize{
             .f = @intCast(image.dim(.f)),
             .h = @intCast(image.dim(.h)),
             .w = @intCast(image.dim(.w)),
         };
 
-        const timestep_embed = self.t_embedder.forward(t.convert(.f32).scale(self.t_scale)).squeeze(.b);
+        const batch_size: u32 = @intCast(image.dim(.b));
+        const timestep_embed = self.t_embedder.forward(t.convert(.f32).scale(self.t_scale));
         const x_patches = patchifyImage(image, patch_size, f_patch_size).convert(self.all_x_embedder[0].weight.dtype());
         const cap_len: u32 = @intCast(cap_feat.dim(.s));
         const padded_cap_len = std.mem.alignForward(u32, cap_len, SEQ_MULTI_OF);
+        const cap_masks = preparePromptMasks(batch_size, padded_cap_len, cap_token_count, cap_aligned_length);
         const x_token_count: u32 = @intCast(x_patches.dim(.s));
         const padded_x_token_count = std.mem.alignForward(u32, x_token_count, SEQ_MULTI_OF);
 
@@ -267,17 +280,18 @@ pub const Transformer = struct {
                 @divExact(size.h, patch_size),
                 @divExact(size.w, patch_size),
             },
-            .{ padded_cap_len + 1, 0, 0 },
+            .{ 0, 0, 0 },
         );
+        x_pos_ids = addImagePositionOffsets(x_pos_ids, cap_aligned_length);
         var x_hidden = self.all_x_embedder[0].forward(x_patches).rename(.{ .dout = .d });
         if (padded_x_token_count > x_token_count) {
             const pad_len = padded_x_token_count - x_token_count;
-            const pad_shape = zml.Shape.init(.{ .s = pad_len, .d = self.dim }, self.x_pad_token.dtype());
+            const pad_shape = zml.Shape.init(.{ .b = batch_size, .s = pad_len, .d = self.dim }, self.x_pad_token.dtype());
             const pad_tokens = self.x_pad_token.rename(.{ .tok = .s }).broad(pad_shape);
             x_hidden = zml.Tensor.concatenate(&.{ x_hidden, pad_tokens }, .s);
             x_pos_ids = zml.Tensor.concatenate(&.{
                 x_pos_ids,
-                zml.Tensor.zeroes(.init(.{ .s = pad_len, .coord = 3 }, .i32)),
+                zml.Tensor.zeroes(.init(.{ .b = batch_size, .s = pad_len, .coord = 3 }, .i32)),
             }, .s);
         }
         const x_freqs = self.rope_embedder.forward(x_pos_ids);
@@ -288,37 +302,124 @@ pub const Transformer = struct {
 
         var cap_hidden = self.cap_embedder.forward(cap_feat).rename(.{ .dout = .d });
         if (padded_cap_len > cap_len) {
-            const pad_shape = zml.Shape.init(.{ .s = padded_cap_len - cap_len, .d = self.dim }, self.cap_pad_token.dtype());
+            const pad_shape = zml.Shape.init(.{ .b = batch_size, .s = padded_cap_len - cap_len, .d = self.dim }, self.cap_pad_token.dtype());
             const pad_tokens = self.cap_pad_token.rename(.{ .tok = .s }).broad(pad_shape);
             cap_hidden = zml.Tensor.concatenate(&.{ cap_hidden, pad_tokens }, .s);
         }
-        const cap_pos_ids = createCoordinateGrid(.{ padded_cap_len, 1, 1 }, .{ 1, 0, 0 });
+        cap_hidden = applyPromptPadding(cap_hidden, cap_masks.tokens, self.cap_pad_token);
+
+        const cap_pos_shape = zml.Shape.init(.{ .b = batch_size, .s = padded_cap_len, .coord = 3 }, .i32);
+        const cap_pos_ids = createCoordinateGrid(.{ padded_cap_len, 1, 1 }, .{ 1, 0, 0 })
+            .insertAxes(0, .{.b})
+            .broad(cap_pos_shape);
         const cap_freqs = self.rope_embedder.forward(cap_pos_ids);
 
         for (self.context_refiner) |layer| {
-            cap_hidden = layer.forward(cap_hidden, null, cap_freqs, null, null, null, null);
+            cap_hidden = layer.forward(cap_hidden, cap_masks.aligned, cap_freqs, null, null, null, null);
         }
 
         var unified = zml.Tensor.concatenate(&.{ x_hidden, cap_hidden }, .s);
         const unified_freqs = zml.Tensor.concatenate(&.{ x_freqs, cap_freqs }, .s);
+        const x_mask = zml.Tensor.constant(.{ .bool = true }).broad(
+            zml.Shape.init(.{ .b = batch_size, .s = padded_x_token_count }, .bool),
+        );
+        const unified_mask = zml.Tensor.concatenate(&.{ x_mask, cap_masks.aligned }, .s);
 
         for (self.layers) |layer| {
-            unified = layer.forward(unified, null, unified_freqs, timestep_embed, null, null, null);
+            unified = layer.forward(unified, unified_mask, unified_freqs, timestep_embed, null, null, null);
         }
 
         unified = self.all_final_layer[0].forward(unified, timestep_embed, null, null, null);
         const image_tokens = unified.slice1d(.s, .{ .end = x_patches.dim(.s) });
-        return unpatchifyOne(image_tokens, size, patch_size, f_patch_size, self.out_channels);
+        return unpatchifyImage(image_tokens, size, patch_size, f_patch_size, self.out_channels);
     }
 
-    pub fn denoiseStep(self: *const Transformer, latent: zml.Tensor, timestep: zml.Tensor, prompt_embeds: zml.Tensor) zml.Tensor {
+    pub fn denoiseStep(
+        self: *const Transformer,
+        latent: zml.Tensor,
+        timestep: zml.Tensor,
+        prompt_embeds: zml.Tensor,
+        prompt_token_count: zml.Tensor,
+        prompt_aligned_length: zml.Tensor,
+    ) zml.Tensor {
         return self.forward(
+            latent.insertAxes(0, .{.b}),
+            timestep,
+            prompt_embeds.insertAxes(0, .{.b}),
+            prompt_token_count.insertAxes(0, .{.b}),
+            prompt_aligned_length.insertAxes(0, .{.b}),
+            self.all_patch_size[0],
+            self.all_f_patch_size[0],
+        ).squeeze(.b);
+    }
+
+    pub const CfgOutput = struct {
+        positive: zml.Tensor,
+        negative: zml.Tensor,
+    };
+
+    const CfgInputs = struct {
+        latent: zml.Tensor,
+        timestep: zml.Tensor,
+        prompt_embeds: zml.Tensor,
+        prompt_token_count: zml.Tensor,
+        prompt_aligned_length: zml.Tensor,
+    };
+
+    fn prepareCfgInputs(
+        latent: zml.Tensor,
+        timestep: zml.Tensor,
+        positive_prompt_embeds: zml.Tensor,
+        positive_token_count: zml.Tensor,
+        positive_aligned_length: zml.Tensor,
+        negative_prompt_embeds: zml.Tensor,
+        negative_token_count: zml.Tensor,
+        negative_aligned_length: zml.Tensor,
+    ) CfgInputs {
+        const batch_size = 2;
+        return .{
+            .latent = zml.Tensor.stack(&.{ latent, latent }, 0, .b),
+            .timestep = timestep.broad(zml.Shape.init(.{ .b = batch_size }, timestep.dtype())),
+            .prompt_embeds = zml.Tensor.stack(&.{ positive_prompt_embeds, negative_prompt_embeds }, 0, .b),
+            .prompt_token_count = zml.Tensor.stack(&.{ positive_token_count, negative_token_count }, 0, .b),
+            .prompt_aligned_length = zml.Tensor.stack(&.{ positive_aligned_length, negative_aligned_length }, 0, .b),
+        };
+    }
+
+    pub fn denoiseCfgStep(
+        self: *const Transformer,
+        latent: zml.Tensor,
+        timestep: zml.Tensor,
+        positive_prompt_embeds: zml.Tensor,
+        positive_token_count: zml.Tensor,
+        positive_aligned_length: zml.Tensor,
+        negative_prompt_embeds: zml.Tensor,
+        negative_token_count: zml.Tensor,
+        negative_aligned_length: zml.Tensor,
+    ) CfgOutput {
+        const inputs = prepareCfgInputs(
             latent,
             timestep,
-            prompt_embeds,
+            positive_prompt_embeds,
+            positive_token_count,
+            positive_aligned_length,
+            negative_prompt_embeds,
+            negative_token_count,
+            negative_aligned_length,
+        );
+        const output = self.forward(
+            inputs.latent,
+            inputs.timestep,
+            inputs.prompt_embeds,
+            inputs.prompt_token_count,
+            inputs.prompt_aligned_length,
             self.all_patch_size[0],
             self.all_f_patch_size[0],
         );
+        return .{
+            .positive = output.slice1d(.b, .single(0)).squeeze(.b),
+            .negative = output.slice1d(.b, .single(1)).squeeze(.b),
+        };
     }
 };
 
@@ -524,7 +625,8 @@ pub const FinalLayer = struct {
             break :blk selectPerToken(scale_noisy, scale_clean, mask, @intCast(seq_len));
         } else blk: {
             const global = self.adaLN_modulation.forward((c orelse @panic("missing c")).silu()).rename(.{ .dout = .d }).addConstant(1.0);
-            break :blk global.insertAxes(.d, .{.s});
+            const scale_shape = zml.Shape.init(.{ .b = x.dim(.b), .s = seq_len, .d = global.dim(.d) }, global.dtype());
+            break :blk global.insertAxes(.d, .{.s}).broad(scale_shape);
         };
 
         const normed = self.norm_final.forward(x).mul(scale);
@@ -609,7 +711,8 @@ pub const RopeEmbedder = struct {
     }
 
     pub fn forward(self: RopeEmbedder, ids: zml.Tensor) zml.Tensor {
-        std.debug.assert(ids.rank() == 2);
+        std.debug.assert(ids.rank() == 2 or ids.rank() == 3);
+        std.debug.assert(ids.shape().hasTags(.{ .s, .coord }));
 
         var result: [3]zml.Tensor = undefined;
         inline for (0..3) |i| {
@@ -619,7 +722,18 @@ pub const RopeEmbedder = struct {
                 .withTags(.{.hd})
                 .scale(-2.0 * std.math.log(f32, std.math.e, self.theta) / @as(f32, @floatFromInt(self.axes_dims[i])))
                 .exp();
-            result[i] = axis_ids.convert(.f32).outer(freqs);
+            result[i] = if (ids.rank() == 2)
+                axis_ids.convert(.f32).outer(freqs)
+            else blk: {
+                const phase_shape = zml.Shape.init(.{
+                    .b = ids.dim(.b),
+                    .s = ids.dim(.s),
+                    .hd = half,
+                }, .f32);
+                const expanded_ids = axis_ids.convert(.f32).insertAxes(.last, .{.hd}).broad(phase_shape);
+                const expanded_freqs = freqs.insertAxes(.hd, .{ .b, .s }).broad(phase_shape);
+                break :blk expanded_ids.mul(expanded_freqs);
+            };
         }
 
         return zml.Tensor.concatenate(&result, -1);
@@ -631,6 +745,52 @@ const ImageSize = struct {
     h: u32,
     w: u32,
 };
+
+const PromptMasks = struct {
+    tokens: zml.Tensor,
+    aligned: zml.Tensor,
+};
+
+fn preparePromptMasks(
+    batch_size: u32,
+    capacity: u32,
+    token_count: zml.Tensor,
+    aligned_length: zml.Tensor,
+) PromptMasks {
+    const shape = zml.Shape.init(.{ .b = batch_size, .s = capacity }, .i32);
+    const positions = zml.Tensor.iota(shape, .s);
+    const token_limits = token_count.convert(.i32).insertAxes(.last, .{.s}).broad(shape);
+    const aligned_limits = aligned_length.convert(.i32).insertAxes(.last, .{.s}).broad(shape);
+    return .{
+        .tokens = positions.cmp(.LT, token_limits),
+        .aligned = positions.cmp(.LT, aligned_limits),
+    };
+}
+
+fn applyPromptPadding(hidden: zml.Tensor, token_mask: zml.Tensor, pad_token: zml.Tensor) zml.Tensor {
+    const pad_tokens = pad_token.rename(.{ .tok = .s }).broad(hidden.shape());
+    const expanded_token_mask = token_mask.insertAxes(.last, .{.d}).broad(hidden.shape());
+    return expanded_token_mask.select(hidden, pad_tokens);
+}
+
+fn addImagePositionOffsets(position_ids: zml.Tensor, aligned_length: zml.Tensor) zml.Tensor {
+    std.debug.assert(position_ids.shape().hasTags(.{ .s, .coord }));
+    std.debug.assert(aligned_length.shape().hasTags(.{.b}));
+
+    const batch_size: u32 = @intCast(aligned_length.dim(.b));
+    const position_shape = zml.Shape.init(.{
+        .b = batch_size,
+        .s = position_ids.dim(.s),
+        .coord = position_ids.dim(.coord),
+    }, position_ids.dtype());
+    const batched_positions = position_ids.insertAxes(0, .{.b}).broad(position_shape);
+    const temporal_offset = aligned_length.convert(position_ids.dtype()).addConstant(1);
+    const zero_offset = zml.Tensor.zeroes(temporal_offset.shape());
+    const offsets = zml.Tensor.stack(&.{ temporal_offset, zero_offset, zero_offset }, .last, .coord)
+        .insertAxes(.coord, .{.s})
+        .broad(position_shape);
+    return batched_positions.add(offsets);
+}
 
 fn createCoordinateGrid(size: [3]u32, start: [3]u32) zml.Tensor {
     const shape = zml.Shape.init(.{ .ft = size[0], .ht = size[1], .wt = size[2] }, .i32);
@@ -645,11 +805,11 @@ fn patchifyImage(image: zml.Tensor, patch_size: u32, f_patch_size: u32) zml.Tens
         .splitAxis(.f, .{ .ft = .auto, .pf = f_patch_size })
         .splitAxis(.h, .{ .ht = .auto, .ph = patch_size })
         .splitAxis(.w, .{ .wt = .auto, .pw = patch_size })
-        .transpose(.{ .ft, .ht, .wt, .pf, .ph, .pw, .c })
+        .transpose(.{ .b, .ft, .ht, .wt, .pf, .ph, .pw, .c })
         .merge(.{ .s = .{ .ft, .ht, .wt }, .d = .{ .pf, .ph, .pw, .c } });
 }
 
-fn unpatchifyOne(
+fn unpatchifyImage(
     x: zml.Tensor,
     size: ImageSize,
     patch_size: u32,
@@ -663,7 +823,7 @@ fn unpatchifyOne(
     return x
         .splitAxis(.s, .{ .ft = f_tokens, .ht = h_tokens, .wt = w_tokens })
         .splitAxis(.d, .{ .pf = f_patch_size, .ph = patch_size, .pw = patch_size, .c = out_channels })
-        .transpose(.{ .c, .ft, .pf, .ht, .ph, .wt, .pw })
+        .transpose(.{ .b, .c, .ft, .pf, .ht, .ph, .wt, .pw })
         .merge(.{ .f = .{ .ft, .pf }, .h = .{ .ht, .ph }, .w = .{ .wt, .pw } });
 }
 
@@ -770,8 +930,6 @@ pub const ZSingleStreamAttention = struct {
         attention_mask: ?zml.Tensor,
         freqs_cis: ?zml.Tensor,
     ) zml.Tensor {
-        _ = attention_mask;
-
         var q = self.to_q.forward(hidden_states).splitAxis(.dout, .{ .h = self.heads, .hd = self.head_dim }).rename(.{ .s = .q });
         var k = self.to_k.forward(hidden_states).splitAxis(.dout, .{ .h = self.heads, .hd = self.head_dim }).rename(.{ .s = .k });
         const v = self.to_v.forward(hidden_states).splitAxis(.dout, .{ .h = self.heads, .hd = self.head_dim }).rename(.{ .s = .k });
@@ -784,12 +942,21 @@ pub const ZSingleStreamAttention = struct {
             k = applyFreqs(k, freqs, "k".ptr);
         }
 
-        const attn_out = zml.nn.sdpa(q, k, v, .{})
+        const additive_mask = if (attention_mask) |mask| prepareAttentionMask(mask, q.dtype()) else null;
+
+        const attn_out = zml.nn.sdpa(q, k, v, .{ .attn_mask = additive_mask })
             .rename(.{ .q = .s })
             .merge(.{ .d = .{ .h, .hd } });
         return self.to_out.forward(attn_out.rename(.{ .d = .dout }));
     }
 };
+
+fn prepareAttentionMask(mask: zml.Tensor, dtype: zml.DataType) zml.Tensor {
+    const key_mask = mask.rename(.{ .s = .k });
+    const zeros = zml.Tensor.constant(dtype.zero()).broad(key_mask.shape());
+    const masked = zml.Tensor.constant(dtype.minValue()).broad(key_mask.shape());
+    return key_mask.select(zeros, masked);
+}
 
 pub const ZImageTransformerBlock = struct {
     dim: u32,
@@ -878,7 +1045,7 @@ pub const ZImageTransformerBlock = struct {
             } else blk: {
                 const mod = mod_layer.forward((adaln_input orelse @panic("missing adaln_input")).convert(mod_layer.weight.dtype()));
                 const msa_scale, const msa_gate, const mlp_scale, const mlp_gate = splitModulation(mod);
-                const mod_shape = zml.Shape.init(.{ .s = seq_len, .d = msa_scale.dim(.d) }, msa_scale.dtype());
+                const mod_shape = zml.Shape.init(.{ .b = x.dim(.b), .s = seq_len, .d = msa_scale.dim(.d) }, msa_scale.dtype());
                 break :blk .{
                     msa_scale.addConstant(1.0).insertAxes(.d, .{.s}).broad(mod_shape),
                     msa_gate.tanh().insertAxes(.d, .{.s}).broad(mod_shape),
@@ -908,4 +1075,379 @@ fn splitModulation(mod: zml.Tensor) struct { zml.Tensor, zml.Tensor, zml.Tensor,
     const scale_mlp = mod.slice1d(.dout, .{ .start = @divExact(mod.dim(.dout), 2), .end = 3 * @divExact(mod.dim(.dout), 4) }).rename(.{ .dout = .d });
     const gate_mlp = mod.slice1d(.dout, .{ .start = 3 * @divExact(mod.dim(.dout), 4), .end = mod.dim(.dout) }).rename(.{ .dout = .d });
     return .{ scale_msa, gate_msa, scale_mlp, gate_mlp };
+}
+
+test "CFG inputs repeat latent and preserve prompt order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
+
+    const latent: zml.Tensor = .init(.{ .c = 1, .f = 1, .h = 1, .w = 2 }, .f32);
+    const timestep: zml.Tensor = .init(.{ .b = 1 }, .f32);
+    const positive_prompt: zml.Tensor = .init(.{ .s = 2, .d = 1 }, .f32);
+    const negative_prompt: zml.Tensor = .init(.{ .s = 2, .d = 1 }, .f32);
+    const length_shape = zml.Shape.init(.{}, .u32);
+    const positive_token_count: zml.Tensor = .fromShape(length_shape);
+    const positive_aligned_length: zml.Tensor = .fromShape(length_shape);
+    const negative_token_count: zml.Tensor = .fromShape(length_shape);
+    const negative_aligned_length: zml.Tensor = .fromShape(length_shape);
+
+    const forward = struct {
+        fn forward(
+            latent_: zml.Tensor,
+            timestep_: zml.Tensor,
+            positive_: zml.Tensor,
+            positive_token_count_: zml.Tensor,
+            positive_aligned_length_: zml.Tensor,
+            negative_: zml.Tensor,
+            negative_token_count_: zml.Tensor,
+            negative_aligned_length_: zml.Tensor,
+        ) Transformer.CfgInputs {
+            return Transformer.prepareCfgInputs(
+                latent_,
+                timestep_,
+                positive_,
+                positive_token_count_,
+                positive_aligned_length_,
+                negative_,
+                negative_token_count_,
+                negative_aligned_length_,
+            );
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(
+        allocator,
+        io,
+        forward,
+        .{
+            latent,
+            timestep,
+            positive_prompt,
+            positive_token_count,
+            positive_aligned_length,
+            negative_prompt,
+            negative_token_count,
+            negative_aligned_length,
+        },
+        platform,
+        .{},
+    );
+    defer exe.deinit();
+
+    var latent_buffer = try zml.Buffer.fromBytes(io, platform, latent.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{ 1, 2 }));
+    defer latent_buffer.deinit();
+    var timestep_buffer = try zml.Buffer.fromBytes(io, platform, timestep.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{0.25}));
+    defer timestep_buffer.deinit();
+    var positive_buffer = try zml.Buffer.fromBytes(io, platform, positive_prompt.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{ 10, 11 }));
+    defer positive_buffer.deinit();
+    var negative_buffer = try zml.Buffer.fromBytes(io, platform, negative_prompt.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{ 20, 21 }));
+    defer negative_buffer.deinit();
+    var positive_token_count_buffer = try zml.Buffer.scalar(io, platform, @as(u32, 35), .u32);
+    defer positive_token_count_buffer.deinit();
+    var positive_aligned_length_buffer = try zml.Buffer.scalar(io, platform, @as(u32, 64), .u32);
+    defer positive_aligned_length_buffer.deinit();
+    var negative_token_count_buffer = try zml.Buffer.scalar(io, platform, @as(u32, 7), .u32);
+    defer negative_token_count_buffer.deinit();
+    var negative_aligned_length_buffer = try zml.Buffer.scalar(io, platform, @as(u32, 32), .u32);
+    defer negative_aligned_length_buffer.deinit();
+
+    var result = try zml.testing.autoCall(
+        allocator,
+        io,
+        &exe,
+        forward,
+        .{
+            latent_buffer,
+            timestep_buffer,
+            positive_buffer,
+            positive_token_count_buffer,
+            positive_aligned_length_buffer,
+            negative_buffer,
+            negative_token_count_buffer,
+            negative_aligned_length_buffer,
+        },
+    );
+    defer result.latent.deinit();
+    defer result.timestep.deinit();
+    defer result.prompt_embeds.deinit();
+    defer result.prompt_token_count.deinit();
+    defer result.prompt_aligned_length.deinit();
+
+    var latent_slice = try result.latent.toSliceAlloc(allocator, io);
+    defer latent_slice.free(allocator);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 1, 2 }, latent_slice.constItems(f32));
+
+    var timestep_slice = try result.timestep.toSliceAlloc(allocator, io);
+    defer timestep_slice.free(allocator);
+    try std.testing.expectEqualSlices(f32, &.{ 0.25, 0.25 }, timestep_slice.constItems(f32));
+
+    var prompt_slice = try result.prompt_embeds.toSliceAlloc(allocator, io);
+    defer prompt_slice.free(allocator);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 11, 20, 21 }, prompt_slice.constItems(f32));
+
+    var token_count_slice = try result.prompt_token_count.toSliceAlloc(allocator, io);
+    defer token_count_slice.free(allocator);
+    try std.testing.expectEqualSlices(u32, &.{ 35, 7 }, token_count_slice.constItems(u32));
+
+    var aligned_length_slice = try result.prompt_aligned_length.toSliceAlloc(allocator, io);
+    defer aligned_length_slice.free(allocator);
+    try std.testing.expectEqualSlices(u32, &.{ 64, 32 }, aligned_length_slice.constItems(u32));
+}
+
+test "Diffusers prompt masks and image RoPE offsets vary per CFG item" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
+
+    const token_count: zml.Tensor = .init(.{ .b = 2 }, .u32);
+    const aligned_length: zml.Tensor = .init(.{ .b = 2 }, .u32);
+    const Output = struct {
+        tokens: zml.Tensor,
+        aligned: zml.Tensor,
+        frequencies: zml.Tensor,
+    };
+    const forward = struct {
+        fn forward(token_count_: zml.Tensor, aligned_length_: zml.Tensor) Output {
+            const masks = preparePromptMasks(2, 96, token_count_, aligned_length_);
+            const positions = addImagePositionOffsets(
+                createCoordinateGrid(.{ 1, 1, 2 }, .{ 0, 0, 0 }),
+                aligned_length_,
+            );
+            const rope: RopeEmbedder = .{
+                .theta = 256.0,
+                .axes_dims = .{ 2, 2, 2 },
+                .axes_lens = .{ 128, 128, 128 },
+            };
+            return .{
+                .tokens = masks.tokens,
+                .aligned = masks.aligned,
+                .frequencies = rope.forward(positions),
+            };
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(
+        allocator,
+        io,
+        forward,
+        .{ token_count, aligned_length },
+        platform,
+        .{},
+    );
+    defer exe.deinit();
+
+    var token_count_buffer = try zml.Buffer.fromBytes(
+        io,
+        platform,
+        token_count.shape(),
+        .replicated,
+        std.mem.sliceAsBytes(&[_]u32{ 35, 7 }),
+    );
+    defer token_count_buffer.deinit();
+    var aligned_length_buffer = try zml.Buffer.fromBytes(
+        io,
+        platform,
+        aligned_length.shape(),
+        .replicated,
+        std.mem.sliceAsBytes(&[_]u32{ 64, 32 }),
+    );
+    defer aligned_length_buffer.deinit();
+
+    var result = try zml.testing.autoCall(
+        allocator,
+        io,
+        &exe,
+        forward,
+        .{ token_count_buffer, aligned_length_buffer },
+    );
+    defer result.tokens.deinit();
+    defer result.aligned.deinit();
+    defer result.frequencies.deinit();
+
+    var token_mask_slice = try result.tokens.toSliceAlloc(allocator, io);
+    defer token_mask_slice.free(allocator);
+    const token_mask = token_mask_slice.constItems(bool);
+    try std.testing.expectEqual(@as(usize, 35), std.mem.count(bool, token_mask[0..96], &.{true}));
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(bool, token_mask[96..192], &.{true}));
+
+    var aligned_mask_slice = try result.aligned.toSliceAlloc(allocator, io);
+    defer aligned_mask_slice.free(allocator);
+    const aligned_mask = aligned_mask_slice.constItems(bool);
+    try std.testing.expectEqual(@as(usize, 64), std.mem.count(bool, aligned_mask[0..96], &.{true}));
+    try std.testing.expectEqual(@as(usize, 32), std.mem.count(bool, aligned_mask[96..192], &.{true}));
+
+    var frequencies_slice = try result.frequencies.toSliceAlloc(allocator, io);
+    defer frequencies_slice.free(allocator);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 65, 0, 0, 65, 0, 1, 33, 0, 0, 33, 0, 1 },
+        frequencies_slice.constItems(f32),
+    );
+}
+
+test "masked caption keys do not affect attention output" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
+
+    const q: zml.Tensor = .init(.{ .b = 1, .h = 1, .q = 1, .hd = 1 }, .f32);
+    const k: zml.Tensor = .init(.{ .b = 1, .h = 1, .k = 2, .hd = 1 }, .f32);
+    const v: zml.Tensor = .init(.{ .b = 1, .h = 1, .k = 2, .hd = 1 }, .f32);
+    const mask: zml.Tensor = .init(.{ .b = 1, .s = 2 }, .bool);
+    const forward = struct {
+        fn forward(q_: zml.Tensor, k_: zml.Tensor, v_: zml.Tensor, mask_: zml.Tensor) zml.Tensor {
+            return zml.nn.sdpa(q_, k_, v_, .{ .attn_mask = prepareAttentionMask(mask_, q_.dtype()) });
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(allocator, io, forward, .{ q, k, v, mask }, platform, .{});
+    defer exe.deinit();
+
+    var q_buffer = try zml.Buffer.fromBytes(io, platform, q.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{0}));
+    defer q_buffer.deinit();
+    var k_buffer = try zml.Buffer.fromBytes(io, platform, k.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{ 0, 0 }));
+    defer k_buffer.deinit();
+    var v_buffer = try zml.Buffer.fromBytes(io, platform, v.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{ 2, 1000 }));
+    defer v_buffer.deinit();
+    var mask_buffer = try zml.Buffer.fromBytes(io, platform, mask.shape(), .replicated, std.mem.sliceAsBytes(&[_]bool{ true, false }));
+    defer mask_buffer.deinit();
+
+    var result = try zml.testing.autoCall(
+        allocator,
+        io,
+        &exe,
+        forward,
+        .{ q_buffer, k_buffer, v_buffer, mask_buffer },
+    );
+    defer result.deinit();
+
+    var result_slice = try result.toSliceAlloc(allocator, io);
+    defer result_slice.free(allocator);
+    try std.testing.expectEqualSlices(f32, &.{2}, result_slice.constItems(f32));
+}
+
+test "Qwen padding is replaced with the learned caption pad token" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
+
+    const hidden: zml.Tensor = .init(.{ .b = 2, .s = 4, .d = 1 }, .f32);
+    const token_mask: zml.Tensor = .init(.{ .b = 2, .s = 4 }, .bool);
+    const pad_token: zml.Tensor = .init(.{ .tok = 1, .d = 1 }, .f32);
+
+    var exe = try zml.module.compile(
+        allocator,
+        io,
+        applyPromptPadding,
+        .{ hidden, token_mask, pad_token },
+        platform,
+        .{},
+    );
+    defer exe.deinit();
+
+    var hidden_buffer = try zml.Buffer.fromBytes(
+        io,
+        platform,
+        hidden.shape(),
+        .replicated,
+        std.mem.sliceAsBytes(&[_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 }),
+    );
+    defer hidden_buffer.deinit();
+    var mask_buffer = try zml.Buffer.fromBytes(
+        io,
+        platform,
+        token_mask.shape(),
+        .replicated,
+        std.mem.sliceAsBytes(&[_]bool{ true, true, true, false, true, false, false, false }),
+    );
+    defer mask_buffer.deinit();
+    var pad_buffer = try zml.Buffer.fromBytes(
+        io,
+        platform,
+        pad_token.shape(),
+        .replicated,
+        std.mem.sliceAsBytes(&[_]f32{99}),
+    );
+    defer pad_buffer.deinit();
+
+    var result = try zml.testing.autoCall(
+        allocator,
+        io,
+        &exe,
+        applyPromptPadding,
+        .{ hidden_buffer, mask_buffer, pad_buffer },
+    );
+    defer result.deinit();
+
+    var result_slice = try result.toSliceAlloc(allocator, io);
+    defer result_slice.free(allocator);
+    try std.testing.expectEqualSlices(
+        f32,
+        &.{ 1, 2, 3, 99, 5, 99, 99, 99 },
+        result_slice.constItems(f32),
+    );
+}
+
+test "batched patchify and unpatchify round trip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
+
+    const input: zml.Tensor = .init(.{ .b = 2, .c = 2, .f = 1, .h = 2, .w = 2 }, .f32);
+    const forward = struct {
+        fn forward(x: zml.Tensor) zml.Tensor {
+            const size: ImageSize = .{ .f = 1, .h = 2, .w = 2 };
+            return unpatchifyImage(patchifyImage(x, 2, 1), size, 2, 1, 2);
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(allocator, io, forward, .{input}, platform, .{});
+    defer exe.deinit();
+
+    var input_values: [16]f32 = undefined;
+    for (&input_values, 0..) |*value, i| value.* = @floatFromInt(i);
+
+    var input_buffer = try zml.Buffer.fromBytes(io, platform, input.shape(), .replicated, std.mem.sliceAsBytes(&input_values));
+    defer input_buffer.deinit();
+
+    var result = try zml.testing.autoCall(allocator, io, &exe, forward, .{input_buffer});
+    defer result.deinit();
+
+    var result_slice = try result.toSliceAlloc(allocator, io);
+    defer result_slice.free(allocator);
+    try std.testing.expectEqualSlices(f32, &input_values, result_slice.constItems(f32));
+}
+
+test "RoPE frequencies broadcast across CFG batch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
+
+    const input: zml.Tensor = .init(.{ .b = 2, .q = 3, .h = 2, .hd = 4 }, .f32);
+    const frequencies: zml.Tensor = .init(.{ .s = 3, .hd = 2 }, .f32);
+    const forward = struct {
+        fn forward(x: zml.Tensor, freqs: zml.Tensor) zml.Tensor {
+            return ZSingleStreamAttention.applyFreqs(x, freqs, "q".ptr);
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(allocator, io, forward, .{ input, frequencies }, platform, .{});
+    defer exe.deinit();
+
+    var input_values: [48]f32 = undefined;
+    for (&input_values, 0..) |*value, i| value.* = @floatFromInt(i);
+    const frequency_values = [_]f32{0} ** 6;
+
+    var input_buffer = try zml.Buffer.fromBytes(io, platform, input.shape(), .replicated, std.mem.sliceAsBytes(&input_values));
+    defer input_buffer.deinit();
+    var frequency_buffer = try zml.Buffer.fromBytes(io, platform, frequencies.shape(), .replicated, std.mem.sliceAsBytes(&frequency_values));
+    defer frequency_buffer.deinit();
+
+    var result = try zml.testing.autoCall(allocator, io, &exe, forward, .{ input_buffer, frequency_buffer });
+    defer result.deinit();
+
+    var result_slice = try result.toSliceAlloc(allocator, io);
+    defer result_slice.free(allocator);
+    try std.testing.expectEqualSlices(f32, &input_values, result_slice.constItems(f32));
 }

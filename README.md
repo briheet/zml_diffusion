@@ -48,6 +48,7 @@ Generate an image on an NVIDIA Linux machine:
 nix run .#cudazimage -- \
   --model=/workspace/models/Z-Image \
   --prompt="A highly detailed cinematic photograph of a majestic orange Maine Coon cat sitting inside an old Japanese ramen shop at night, wearing a tiny dark green raincoat, one paw resting beside a steaming ceramic bowl, warm paper lanterns illuminating its individual wet fur strands, neon signs reflected in the rain-covered window behind it, pedestrians with transparent umbrellas softly blurred outside, intricate wooden interior, rising volumetric steam, realistic whiskers and amber eyes, shallow depth of field, natural film grain, dramatic warm and cool color contrast, physically accurate reflections, photorealistic, editorial photography, 85mm lens, f/1.8, exceptional detail" \
+  --negative-prompt="blurry, low quality, distorted anatomy, text, watermark" \
   --height=1024 \
   --width=1024 \
   --steps=48 \
@@ -55,6 +56,10 @@ nix run .#cudazimage -- \
   --seqlen=512 \
   --output=/workspace/cinematic-cat-1024.png
 ```
+
+With a positive guidance scale, the positive and negative prompts run together
+as a batch of two in one transformer call. Prompt padding, attention masks, and
+per-prompt RoPE offsets follow the Diffusers Z-Image pipeline.
 
 ## Benchmark
 

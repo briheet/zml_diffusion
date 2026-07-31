@@ -132,3 +132,10 @@ pub fn detectModelType(allocator: std.mem.Allocator, io: std.Io, repo: std.Io.Di
     if (std.mem.eql(u8, parsed.value._class_name, "ZImagePipeline")) return .zimage;
     return error.UnknownModelType;
 }
+
+test "models" {
+    std.testing.refAllDecls(@This());
+    _ = zimage.scheduler;
+    _ = zimage.text_encoder;
+    _ = zimage.transformer;
+}

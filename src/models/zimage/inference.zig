@@ -74,6 +74,7 @@ pub const CompiledModel = struct {
 
     text_encoder: zml.Exe,
     transformer: zml.Exe,
+    cfg_transformer: zml.Exe,
     latent_generator: zml.Exe,
     scheduler_step: zml.Exe,
     guided_scheduler_step: zml.Exe,
@@ -94,6 +95,7 @@ pub const CompiledModel = struct {
 
             .text_encoder = compiled_result.text_encoder,
             .transformer = compiled_result.transformer,
+            .cfg_transformer = compiled_result.cfg_transformer,
             .latent_generator = compiled_result.latent_generator,
             .scheduler_step = compiled_result.scheduler_step,
             .guided_scheduler_step = compiled_result.guided_scheduler_step,
@@ -104,6 +106,7 @@ pub const CompiledModel = struct {
     pub fn deinit(self: *CompiledModel) void {
         self.text_encoder.deinit();
         self.transformer.deinit();
+        self.cfg_transformer.deinit();
         self.latent_generator.deinit();
         self.scheduler_step.deinit();
         self.guided_scheduler_step.deinit();
@@ -114,6 +117,7 @@ pub const CompiledModel = struct {
 pub const CompiledModelResult = struct {
     text_encoder: zml.Exe,
     transformer: zml.Exe,
+    cfg_transformer: zml.Exe,
     latent_generator: zml.Exe,
     scheduler_step: zml.Exe,
     guided_scheduler_step: zml.Exe,
@@ -147,9 +151,13 @@ const PromptInputs = struct {
 
 const EncodedPrompt = struct {
     embeds: zml.Buffer,
+    token_count: zml.Buffer,
+    aligned_length: zml.Buffer,
 
     fn deinit(self: *EncodedPrompt) void {
         self.embeds.deinit();
+        self.token_count.deinit();
+        self.aligned_length.deinit();
     }
 };
 
@@ -160,6 +168,176 @@ const EncodedPrompts = struct {
     fn deinit(self: *EncodedPrompts) void {
         self.positive.deinit();
         if (self.negative) |*negative| negative.deinit();
+    }
+};
+
+const CfgTransformerOutput = struct {
+    positive: zml.Buffer,
+    negative: zml.Buffer,
+
+    fn deinit(self: *CfgTransformerOutput) void {
+        self.positive.deinit();
+        self.negative.deinit();
+    }
+};
+
+const ExecutionState = struct {
+    args: zml.Exe.Arguments,
+    results: zml.Exe.Results,
+
+    fn init(allocator: std.mem.Allocator, exe: *const zml.Exe) !ExecutionState {
+        var args = try exe.args(allocator);
+        errdefer args.deinit(allocator);
+        const results = try exe.results(allocator);
+        return .{ .args = args, .results = results };
+    }
+
+    fn deinit(self: *ExecutionState, allocator: std.mem.Allocator) void {
+        self.args.deinit(allocator);
+        self.results.deinit(allocator);
+    }
+};
+
+const ExecutionRunner = struct {
+    text_encoder: ExecutionState,
+    transformer: ExecutionState,
+    cfg_transformer: ExecutionState,
+    latent_generator: ExecutionState,
+    scheduler_step: ExecutionState,
+    guided_scheduler_step: ExecutionState,
+    vae_decode: ExecutionState,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        compiled_model: *const CompiledModel,
+        model_buffers: *zimage_model.Buffers,
+    ) !ExecutionRunner {
+        var text_encoder = try ExecutionState.init(allocator, &compiled_model.text_encoder);
+        errdefer text_encoder.deinit(allocator);
+        text_encoder.args.bake(&model_buffers.text_encoder.inner);
+
+        var transformer = try ExecutionState.init(allocator, &compiled_model.transformer);
+        errdefer transformer.deinit(allocator);
+        transformer.args.bake(&model_buffers.transformer);
+
+        var cfg_transformer = try ExecutionState.init(allocator, &compiled_model.cfg_transformer);
+        errdefer cfg_transformer.deinit(allocator);
+        cfg_transformer.args.bake(&model_buffers.transformer);
+
+        var latent_generator = try ExecutionState.init(allocator, &compiled_model.latent_generator);
+        errdefer latent_generator.deinit(allocator);
+
+        var scheduler_step = try ExecutionState.init(allocator, &compiled_model.scheduler_step);
+        errdefer scheduler_step.deinit(allocator);
+
+        var guided_scheduler_step = try ExecutionState.init(allocator, &compiled_model.guided_scheduler_step);
+        errdefer guided_scheduler_step.deinit(allocator);
+
+        var vae_decode = try ExecutionState.init(allocator, &compiled_model.vae_decode);
+        errdefer vae_decode.deinit(allocator);
+        vae_decode.args.bake(&model_buffers.vae);
+
+        return .{
+            .text_encoder = text_encoder,
+            .transformer = transformer,
+            .cfg_transformer = cfg_transformer,
+            .latent_generator = latent_generator,
+            .scheduler_step = scheduler_step,
+            .guided_scheduler_step = guided_scheduler_step,
+            .vae_decode = vae_decode,
+        };
+    }
+
+    fn deinit(self: *ExecutionRunner, allocator: std.mem.Allocator) void {
+        self.text_encoder.deinit(allocator);
+        self.transformer.deinit(allocator);
+        self.cfg_transformer.deinit(allocator);
+        self.latent_generator.deinit(allocator);
+        self.scheduler_step.deinit(allocator);
+        self.guided_scheduler_step.deinit(allocator);
+        self.vae_decode.deinit(allocator);
+    }
+};
+
+const StepDeviceInputs = struct {
+    timestep: zml.Buffer,
+    current_sigma: zml.Buffer,
+    next_sigma: zml.Buffer,
+
+    fn deinit(self: *StepDeviceInputs) void {
+        self.timestep.deinit();
+        self.current_sigma.deinit();
+        self.next_sigma.deinit();
+    }
+};
+
+const DenoisingDeviceInputs = struct {
+    steps: []StepDeviceInputs,
+    guidance_scale: ?zml.Buffer,
+    cfg_normalization: ?zml.Buffer,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        platform: *const zml.Platform,
+        scheduler_state: *const zimage_scheduler.Scheduler,
+        guidance_scale: ?f32,
+        cfg_normalization: bool,
+    ) !DenoisingDeviceInputs {
+        std.debug.assert(scheduler_state.sigmas.len == scheduler_state.timesteps.len + 1);
+
+        const steps = try allocator.alloc(StepDeviceInputs, scheduler_state.timesteps.len);
+        errdefer allocator.free(steps);
+
+        var initialized_steps: usize = 0;
+        errdefer for (steps[0..initialized_steps]) |*step| step.deinit();
+
+        for (steps, scheduler_state.timesteps, 0..) |*step, raw_timestep, i| {
+            const normalized_timestep = (1000.0 - raw_timestep) / 1000.0;
+            const timestep_values = [_]f32{normalized_timestep};
+            var timestep = try zml.Buffer.fromBytes(
+                io,
+                platform,
+                zml.Shape.init(.{ .b = 1 }, .f32),
+                .replicated,
+                std.mem.sliceAsBytes(&timestep_values),
+            );
+            errdefer timestep.deinit();
+
+            var current_sigma = try zml.Buffer.scalar(io, platform, scheduler_state.sigmas[i], .f32);
+            errdefer current_sigma.deinit();
+            const next_sigma = try zml.Buffer.scalar(io, platform, scheduler_state.sigmas[i + 1], .f32);
+
+            step.* = .{
+                .timestep = timestep,
+                .current_sigma = current_sigma,
+                .next_sigma = next_sigma,
+            };
+            initialized_steps = i + 1;
+        }
+
+        var guidance_scale_buffer: ?zml.Buffer = null;
+        errdefer if (guidance_scale_buffer) |*buffer| buffer.deinit();
+        var cfg_normalization_buffer: ?zml.Buffer = null;
+        errdefer if (cfg_normalization_buffer) |*buffer| buffer.deinit();
+
+        if (guidance_scale) |scale| {
+            guidance_scale_buffer = try zml.Buffer.scalar(io, platform, scale, .f32);
+            cfg_normalization_buffer = try zml.Buffer.scalar(io, platform, cfg_normalization, .bool);
+        }
+
+        return .{
+            .steps = steps,
+            .guidance_scale = guidance_scale_buffer,
+            .cfg_normalization = cfg_normalization_buffer,
+        };
+    }
+
+    fn deinit(self: *DenoisingDeviceInputs, allocator: std.mem.Allocator) void {
+        for (self.steps) |*step| step.deinit();
+        allocator.free(self.steps);
+        if (self.guidance_scale) |*buffer| buffer.deinit();
+        if (self.cfg_normalization) |*buffer| buffer.deinit();
     }
 };
 
@@ -291,12 +469,64 @@ fn compileTransformerExe(
         .s = prompt_seqlen,
         .d = hidden_size,
     }, .f32);
+    const prompt_token_count: zml.Tensor = .init(.{}, .u32);
+    const prompt_aligned_length: zml.Tensor = .init(.{}, .u32);
 
     return platform.compileFn(
         allocator,
         io,
         zimage_transformer.Transformer.denoiseStep,
-        .{ transformer, latent, timestep, prompt_embeds },
+        .{ transformer, latent, timestep, prompt_embeds, prompt_token_count, prompt_aligned_length },
+        .{ .shardings = shardings },
+    );
+}
+
+fn compileCfgTransformerExe(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    platform: *const zml.Platform,
+    transformer: *const zimage_transformer.Transformer,
+    prompt_seqlen: u32,
+    latent_frames: u32,
+    latent_height: u32,
+    latent_width: u32,
+    hidden_size: u32,
+    shardings: []const zml.Sharding,
+) !zml.Exe {
+    const latent: zml.Tensor = .init(.{
+        .c = transformer.in_channels,
+        .f = latent_frames,
+        .h = latent_height,
+        .w = latent_width,
+    }, .f32);
+    const timestep: zml.Tensor = .init(.{ .b = 1 }, .f32);
+    const prompt_shape = zml.Shape.init(.{
+        .s = prompt_seqlen,
+        .d = hidden_size,
+    }, .f32);
+    const positive_prompt_embeds: zml.Tensor = .fromShape(prompt_shape);
+    const negative_prompt_embeds: zml.Tensor = .fromShape(prompt_shape);
+    const length_shape = zml.Shape.init(.{}, .u32);
+    const positive_token_count: zml.Tensor = .fromShape(length_shape);
+    const positive_aligned_length: zml.Tensor = .fromShape(length_shape);
+    const negative_token_count: zml.Tensor = .fromShape(length_shape);
+    const negative_aligned_length: zml.Tensor = .fromShape(length_shape);
+
+    return platform.compileFn(
+        allocator,
+        io,
+        zimage_transformer.Transformer.denoiseCfgStep,
+        .{
+            transformer,
+            latent,
+            timestep,
+            positive_prompt_embeds,
+            positive_token_count,
+            positive_aligned_length,
+            negative_prompt_embeds,
+            negative_token_count,
+            negative_aligned_length,
+        },
         .{ .shardings = shardings },
     );
 }
@@ -468,7 +698,7 @@ fn compileExecutables(
     const text_encoder = &loaded_model.inner.text_encoder.inner;
     const transformer = &loaded_model.inner.transformer;
     const vae = &loaded_model.inner.vae;
-    progress.increaseEstimatedTotalItems(6);
+    progress.increaseEstimatedTotalItems(7);
 
     var text_encoder_future = try io.concurrent(struct {
         fn call(
@@ -525,6 +755,40 @@ fn compileExecutables(
     }.call, .{ allocator, io, platform, transformer, params, loaded_model.inner.text_encoder.config.hidden_size, &all_shardings, progress });
     var transformer_future_awaited = false;
     errdefer if (!transformer_future_awaited) if (transformer_future.cancel(io)) |exe| exe.deinit() else |_| {};
+
+    var cfg_transformer_future = try io.concurrent(struct {
+        fn call(
+            allocator_: std.mem.Allocator,
+            io_: std.Io,
+            platform_: *const zml.Platform,
+            transformer_: *const zimage_transformer.Transformer,
+            params_: CompilationParameters,
+            hidden_size_: u32,
+            shardings_: []const zml.Sharding,
+            progress_: *std.Progress.Node,
+        ) !zml.Exe {
+            var node = progress_.start("Compiling CFG transformer...", 1);
+            defer node.end();
+
+            const now_: std.Io.Timestamp = .now(io_, .awake);
+            defer log.info("Compiled CFG transformer [{f}]", .{now_.untilNow(io_, .awake)});
+
+            return compileCfgTransformerExe(
+                allocator_,
+                io_,
+                platform_,
+                transformer_,
+                params_.prompt_seqlen,
+                params_.latent_frames,
+                params_.latent_height,
+                params_.latent_width,
+                hidden_size_,
+                shardings_,
+            );
+        }
+    }.call, .{ allocator, io, platform, transformer, params, loaded_model.inner.text_encoder.config.hidden_size, &all_shardings, progress });
+    var cfg_transformer_future_awaited = false;
+    errdefer if (!cfg_transformer_future_awaited) if (cfg_transformer_future.cancel(io)) |exe| exe.deinit() else |_| {};
 
     var latent_generator_future = try io.concurrent(struct {
         fn call(
@@ -660,6 +924,10 @@ fn compileExecutables(
     transformer_future_awaited = true;
     errdefer transformer_exe.deinit();
 
+    const cfg_transformer_exe = try cfg_transformer_future.await(io);
+    cfg_transformer_future_awaited = true;
+    errdefer cfg_transformer_exe.deinit();
+
     const latent_generator_exe = try latent_generator_future.await(io);
     latent_generator_future_awaited = true;
     errdefer latent_generator_exe.deinit();
@@ -678,6 +946,7 @@ fn compileExecutables(
     return .{
         .text_encoder = text_encoder_exe,
         .transformer = transformer_exe,
+        .cfg_transformer = cfg_transformer_exe,
         .latent_generator = latent_generator_exe,
         .scheduler_step = scheduler_step_exe,
         .guided_scheduler_step = guided_scheduler_step_exe,
@@ -693,6 +962,7 @@ pub const InferencePipeline = struct {
     model_buffers: zimage_model.Buffers,
     text_tokenizer: zimage_tokenizer.Tokenizer,
     scheduler_state: zimage_scheduler.Scheduler,
+    runner: ExecutionRunner,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -749,6 +1019,9 @@ pub const InferencePipeline = struct {
         );
         errdefer scheduler_state.deinit(allocator);
 
+        var runner = try ExecutionRunner.init(allocator, &compiled_model, &model_buffers);
+        errdefer runner.deinit(allocator);
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -757,10 +1030,12 @@ pub const InferencePipeline = struct {
             .model_buffers = model_buffers,
             .text_tokenizer = text_tokenizer,
             .scheduler_state = scheduler_state,
+            .runner = runner,
         };
     }
 
     pub fn deinit(self: *InferencePipeline, allocator: std.mem.Allocator) void {
+        self.runner.deinit(allocator);
         self.compiled_model.loaded_model.unloadBuffers(&self.model_buffers, allocator);
         self.compiled_model.deinit();
         self.text_tokenizer.deinit();
@@ -802,21 +1077,36 @@ pub const InferencePipeline = struct {
         var prompt_inputs = try uploadPromptInputs(self.io, self.platform, &prompt_encoding);
         defer prompt_inputs.deinit();
 
-        var text_encoder_args = try self.compiled_model.text_encoder.args(self.allocator);
-        defer text_encoder_args.deinit(self.allocator);
-        var text_encoder_results = try self.compiled_model.text_encoder.results(self.allocator);
-        defer text_encoder_results.deinit(self.allocator);
-
-        text_encoder_args.set(.{
-            &self.model_buffers.text_encoder.inner,
+        self.runner.text_encoder.args.set(.{
             prompt_inputs.ids,
             prompt_inputs.mask,
         });
-        self.compiled_model.text_encoder.call(text_encoder_args, &text_encoder_results);
+        self.compiled_model.text_encoder.call(self.runner.text_encoder.args, &self.runner.text_encoder.results);
 
-        // Keep the padded sequence length expected by the precompiled transformer.
+        // Diffusers strips Qwen padding, then pads each caption to a multiple
+        // of 32 inside the transformer. Keep the fixed-size embeddings and
+        // carry the two runtime lengths needed to reproduce those semantics.
+        var embeds = self.runner.text_encoder.results.get(zml.Buffer);
+        errdefer embeds.deinit();
+        var token_count = try zml.Buffer.scalar(
+            self.io,
+            self.platform,
+            prompt_encoding.token_count,
+            .u32,
+        );
+        errdefer token_count.deinit();
+        const aligned_token_count = std.mem.alignForward(u32, prompt_encoding.token_count, zimage_transformer.SEQ_MULTI_OF);
+        const aligned_length = try zml.Buffer.scalar(
+            self.io,
+            self.platform,
+            aligned_token_count,
+            .u32,
+        );
+
         var prompt_embeds: EncodedPrompt = .{
-            .embeds = text_encoder_results.get(zml.Buffer),
+            .embeds = embeds,
+            .token_count = token_count,
+            .aligned_length = aligned_length,
         };
         errdefer prompt_embeds.deinit();
 
@@ -843,18 +1133,11 @@ pub const InferencePipeline = struct {
         );
         defer prompt_embeds.deinit();
 
-        const transformer_exe = &self.compiled_model.transformer;
-
-        // Prepare latents
-        var latent_generator_args = try self.compiled_model.latent_generator.args(self.allocator);
-        defer latent_generator_args.deinit(self.allocator);
-        var latent_generator_results = try self.compiled_model.latent_generator.results(self.allocator);
-        defer latent_generator_results.deinit(self.allocator);
-
         // Generate latents
-        self.compiled_model.latent_generator.call(latent_generator_args, &latent_generator_results);
-        var latents = latent_generator_results.get(zml.Buffer);
+        self.compiled_model.latent_generator.call(self.runner.latent_generator.args, &self.runner.latent_generator.results);
+        var latents = self.runner.latent_generator.results.get(zml.Buffer);
         defer latents.deinit();
+
         try logBufferStats(self.allocator, self.io, "initial latents", latents);
 
         const image_seq_len = (self.compiled_model.params.latent_height / 2) * (self.compiled_model.params.latent_width / 2);
@@ -869,75 +1152,87 @@ pub const InferencePipeline = struct {
             const intercept = base_shift - slope * base_seq_len;
             break :blk @as(f32, @floatFromInt(image_seq_len)) * slope + intercept;
         } else null;
+
+        // Set timesteps
         try self.scheduler_state.setTimesteps(self.allocator, opts.num_inference_steps, mu);
 
+        var denoising_inputs = try DenoisingDeviceInputs.init(
+            self.allocator,
+            self.io,
+            self.platform,
+            &self.scheduler_state,
+            if (do_cfg) opts.guidance_scale else null,
+            opts.cfg_normalization,
+        );
+        defer denoising_inputs.deinit(self.allocator);
+
+        if (do_cfg) {
+            // Model buffers are baked. Prompt buffers and their lengths are
+            // constant for every denoising step, so set them once.
+            self.runner.cfg_transformer.args.setPartial(.{
+                prompt_embeds.positive.embeds,
+                prompt_embeds.positive.token_count,
+                prompt_embeds.positive.aligned_length,
+                prompt_embeds.negative.?.embeds,
+                prompt_embeds.negative.?.token_count,
+                prompt_embeds.negative.?.aligned_length,
+            }, 2);
+        } else {
+            self.runner.transformer.args.setPartial(.{
+                prompt_embeds.positive.embeds,
+                prompt_embeds.positive.token_count,
+                prompt_embeds.positive.aligned_length,
+            }, 2);
+        }
+
         // Denoising loop
-        for (self.scheduler_state.timesteps, 0..) |raw_timestep, step_index| {
+        for (denoising_inputs.steps, 0..) |*step_inputs, step_index| {
             const step_number = step_index + 1;
             const step_started: std.Io.Timestamp = .now(self.io, .awake);
             log.info(
                 "Denoising step {d}/{d}{s}...",
                 .{
                     step_number,
-                    self.scheduler_state.timesteps.len,
-                    if (do_cfg) " (CFG: 2 transformer calls)" else "",
+                    denoising_inputs.steps.len,
+                    if (do_cfg) " (CFG: batched transformer)" else "",
                 },
             );
 
-            const normalized_timestep = (1000.0 - raw_timestep) / 1000.0;
-            const timestep_values = [_]f32{normalized_timestep};
-            var timestep_buffer = try zml.Buffer.fromBytes(
-                self.io,
-                self.platform,
-                zml.Shape.init(.{ .b = 1 }, .f32),
-                .replicated,
-                std.mem.sliceAsBytes(&timestep_values),
-            );
-            defer timestep_buffer.deinit();
-
-            var transformer_args = try transformer_exe.args(self.allocator);
-            defer transformer_args.deinit(self.allocator);
-            var transformer_results = try transformer_exe.results(self.allocator);
-            defer transformer_results.deinit(self.allocator);
-
-            transformer_args.set(.{ &self.model_buffers.transformer, latents, timestep_buffer, prompt_embeds.positive.embeds });
-            transformer_exe.call(transformer_args, &transformer_results);
-
-            var positive_output = transformer_results.get(zml.Buffer);
-            defer positive_output.deinit();
-
             const next_latents = if (do_cfg) blk: {
-                var negative_transformer_args = try transformer_exe.args(self.allocator);
-                defer negative_transformer_args.deinit(self.allocator);
-                var negative_transformer_results = try transformer_exe.results(self.allocator);
-                defer negative_transformer_results.deinit(self.allocator);
+                self.runner.cfg_transformer.args.set(.{ latents, step_inputs.timestep });
+                self.compiled_model.cfg_transformer.call(
+                    self.runner.cfg_transformer.args,
+                    &self.runner.cfg_transformer.results,
+                );
 
-                negative_transformer_args.set(.{
-                    &self.model_buffers.transformer,
-                    latents,
-                    timestep_buffer,
-                    prompt_embeds.negative.?.embeds,
-                });
-                transformer_exe.call(negative_transformer_args, &negative_transformer_results);
-
-                var negative_output = negative_transformer_results.get(zml.Buffer);
-                defer negative_output.deinit();
+                var cfg_output = self.runner.cfg_transformer.results.get(CfgTransformerOutput);
+                defer cfg_output.deinit();
 
                 break :blk try self.runGuidedSchedulerStep(
-                    positive_output,
-                    negative_output,
+                    cfg_output.positive,
+                    cfg_output.negative,
                     latents,
-                    raw_timestep,
-                    opts.guidance_scale,
-                    opts.cfg_normalization,
+                    step_inputs,
+                    &denoising_inputs,
                 );
-            } else try self.runSchedulerStep(positive_output, latents, raw_timestep);
+            } else blk: {
+                self.runner.transformer.args.set(.{ latents, step_inputs.timestep });
+                self.compiled_model.transformer.call(
+                    self.runner.transformer.args,
+                    &self.runner.transformer.results,
+                );
+
+                var positive_output = self.runner.transformer.results.get(zml.Buffer);
+                defer positive_output.deinit();
+
+                break :blk try self.runSchedulerStep(positive_output, latents, step_inputs);
+            };
 
             latents.deinit();
             latents = next_latents;
             log.info(
                 "Denoising step {d}/{d} [{f}]",
-                .{ step_number, self.scheduler_state.timesteps.len, step_started.untilNow(self.io, .awake) },
+                .{ step_number, denoising_inputs.steps.len, step_started.untilNow(self.io, .awake) },
             );
         }
 
@@ -954,15 +1249,10 @@ pub const InferencePipeline = struct {
         var scaled_latents = try zml.Buffer.fromSlice(self.io, self.platform, scaled_latent_slice, .replicated);
         defer scaled_latents.deinit();
 
-        var vae_args = try self.compiled_model.vae_decode.args(self.allocator);
-        defer vae_args.deinit(self.allocator);
-        var vae_results = try self.compiled_model.vae_decode.results(self.allocator);
-        defer vae_results.deinit(self.allocator);
+        self.runner.vae_decode.args.set(.{scaled_latents});
+        self.compiled_model.vae_decode.call(self.runner.vae_decode.args, &self.runner.vae_decode.results);
 
-        vae_args.set(.{ &self.model_buffers.vae, scaled_latents });
-        self.compiled_model.vae_decode.call(vae_args, &vae_results);
-
-        var image_buffer = vae_results.get(zml.Buffer);
+        var image_buffer = self.runner.vae_decode.results.get(zml.Buffer);
         defer image_buffer.deinit();
         try logBufferStats(self.allocator, self.io, "vae decoded image", image_buffer);
 
@@ -1012,31 +1302,17 @@ pub const InferencePipeline = struct {
         self: *InferencePipeline,
         noise_pred: zml.Buffer,
         latents: zml.Buffer,
-        timestep: f32,
+        step_inputs: *const StepDeviceInputs,
     ) !zml.Buffer {
-        const sigmas = self.scheduler_state.nextStepSigmas(timestep);
-
-        var current_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.current, .f32);
-        defer current_sigma_buf.deinit();
-
-        var next_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.next, .f32);
-        defer next_sigma_buf.deinit();
-
-        var scheduler_args = try self.compiled_model.scheduler_step.args(self.allocator);
-        defer scheduler_args.deinit(self.allocator);
-
-        var scheduler_results = try self.compiled_model.scheduler_step.results(self.allocator);
-        defer scheduler_results.deinit(self.allocator);
-
-        scheduler_args.set(.{
+        self.runner.scheduler_step.args.set(.{
             noise_pred,
             latents,
-            current_sigma_buf,
-            next_sigma_buf,
+            step_inputs.current_sigma,
+            step_inputs.next_sigma,
         });
-        self.compiled_model.scheduler_step.call(scheduler_args, &scheduler_results);
+        self.compiled_model.scheduler_step.call(self.runner.scheduler_step.args, &self.runner.scheduler_step.results);
 
-        return scheduler_results.get(zml.Buffer);
+        return self.runner.scheduler_step.results.get(zml.Buffer);
     }
 
     fn runGuidedSchedulerStep(
@@ -1044,41 +1320,23 @@ pub const InferencePipeline = struct {
         positive_output: zml.Buffer,
         negative_output: zml.Buffer,
         latents: zml.Buffer,
-        timestep: f32,
-        guidance_scale: f32,
-        normalize: bool,
+        step_inputs: *const StepDeviceInputs,
+        denoising_inputs: *const DenoisingDeviceInputs,
     ) !zml.Buffer {
-        const sigmas = self.scheduler_state.nextStepSigmas(timestep);
-
-        var current_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.current, .f32);
-        defer current_sigma_buf.deinit();
-
-        var next_sigma_buf = try zml.Buffer.scalar(self.io, self.platform, sigmas.next, .f32);
-        defer next_sigma_buf.deinit();
-
-        var guidance_scale_buf = try zml.Buffer.scalar(self.io, self.platform, guidance_scale, .f32);
-        defer guidance_scale_buf.deinit();
-
-        var normalize_buf = try zml.Buffer.scalar(self.io, self.platform, normalize, .bool);
-        defer normalize_buf.deinit();
-
-        var scheduler_args = try self.compiled_model.guided_scheduler_step.args(self.allocator);
-        defer scheduler_args.deinit(self.allocator);
-
-        var scheduler_results = try self.compiled_model.guided_scheduler_step.results(self.allocator);
-        defer scheduler_results.deinit(self.allocator);
-
-        scheduler_args.set(.{
+        self.runner.guided_scheduler_step.args.set(.{
             positive_output,
             negative_output,
             latents,
-            current_sigma_buf,
-            next_sigma_buf,
-            guidance_scale_buf,
-            normalize_buf,
+            step_inputs.current_sigma,
+            step_inputs.next_sigma,
+            denoising_inputs.guidance_scale.?,
+            denoising_inputs.cfg_normalization.?,
         });
-        self.compiled_model.guided_scheduler_step.call(scheduler_args, &scheduler_results);
+        self.compiled_model.guided_scheduler_step.call(
+            self.runner.guided_scheduler_step.args,
+            &self.runner.guided_scheduler_step.results,
+        );
 
-        return scheduler_results.get(zml.Buffer);
+        return self.runner.guided_scheduler_step.results.get(zml.Buffer);
     }
 };

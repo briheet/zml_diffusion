@@ -1,10 +1,20 @@
-load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("@rules_zig//zig:defs.bzl", "zig_binary", "zig_test")
 load("@rules_zig//zig/zls:zls_completion.bzl", "zls_completion")
 
 zig_binary(
     name = "zml_diffusion",
     srcs = glob(["src/**/*.zig"]),
     main = "src/main.zig",
+    deps = [
+        "@zigimg",
+        "@zml//zml",
+    ],
+)
+
+zig_test(
+    name = "zml_diffusion_test",
+    srcs = glob(["src/**/*.zig"]),
+    main = "src/models.zig",
     deps = [
         "@zigimg",
         "@zml//zml",
