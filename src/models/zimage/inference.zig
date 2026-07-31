@@ -129,16 +129,6 @@ const F32Buffer = struct {
     owned: bool,
 };
 
-const BufferStats = struct {
-    min: f32,
-    max: f32,
-    mean: f64,
-
-    fn fmt(self: BufferStats, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
-        try writer.print("min={d:.6} max={d:.6} mean={d:.6}", .{ self.min, self.max, self.mean });
-    }
-};
-
 const PromptInputs = struct {
     ids: zml.Buffer,
     mask: zml.Buffer,
@@ -383,47 +373,6 @@ fn bufferToF32(
         .buffer = converted,
         .owned = true,
     };
-}
-
-fn computeSliceStats(slice: zml.Slice) BufferStats {
-    return switch (slice.dtype()) {
-        inline else => |dt| blk: {
-            const values = slice.constItems(dt.toZigType());
-            if (values.len == 0) break :blk BufferStats{ .min = 0.0, .max = 0.0, .mean = 0.0 };
-
-            var min_value: f32 = std.math.inf(f32);
-            var max_value: f32 = -std.math.inf(f32);
-            var sum: f64 = 0.0;
-            for (values) |value| {
-                const as_f32: f32 = switch (comptime dt.class()) {
-                    .float => zml.floats.floatCast(f32, value),
-                    .integer => @floatFromInt(value),
-                    .bool => if (value) 1.0 else 0.0,
-                    else => unreachable,
-                };
-                min_value = @min(min_value, as_f32);
-                max_value = @max(max_value, as_f32);
-                sum += as_f32;
-            }
-
-            break :blk BufferStats{
-                .min = min_value,
-                .max = max_value,
-                .mean = sum / @as(f64, @floatFromInt(values.len)),
-            };
-        },
-    };
-}
-
-fn logBufferStats(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    label: []const u8,
-    buffer: zml.Buffer,
-) !void {
-    var slice = try buffer.toSliceAlloc(allocator, io);
-    defer slice.free(allocator);
-    log.info("{s}: {}", .{ label, computeSliceStats(slice) });
 }
 
 fn compileTextEncoderExe(
@@ -1048,11 +997,11 @@ pub const InferencePipeline = struct {
         negative_prompt: []const u8,
         do_classifier_free_guidance: bool,
     ) !EncodedPrompts {
-        var positive = try self.encodePromptItem(prompt, "prompt embeddings");
+        var positive = try self.encodePromptItem(prompt);
         errdefer positive.deinit();
 
         const negative = if (do_classifier_free_guidance)
-            try self.encodePromptItem(negative_prompt, "negative prompt embeddings")
+            try self.encodePromptItem(negative_prompt)
         else
             null;
 
@@ -1065,7 +1014,6 @@ pub const InferencePipeline = struct {
     fn encodePromptItem(
         self: *InferencePipeline,
         prompt: []const u8,
-        log_label: []const u8,
     ) !EncodedPrompt {
         var prompt_encoding = try self.text_tokenizer.encodePromptAlloc(
             self.allocator,
@@ -1110,7 +1058,6 @@ pub const InferencePipeline = struct {
         };
         errdefer prompt_embeds.deinit();
 
-        try logBufferStats(self.allocator, self.io, log_label, prompt_embeds.embeds);
         return prompt_embeds;
     }
 
@@ -1137,8 +1084,6 @@ pub const InferencePipeline = struct {
         self.compiled_model.latent_generator.call(self.runner.latent_generator.args, &self.runner.latent_generator.results);
         var latents = self.runner.latent_generator.results.get(zml.Buffer);
         defer latents.deinit();
-
-        try logBufferStats(self.allocator, self.io, "initial latents", latents);
 
         const image_seq_len = (self.compiled_model.params.latent_height / 2) * (self.compiled_model.params.latent_width / 2);
 
@@ -1189,14 +1134,6 @@ pub const InferencePipeline = struct {
         for (denoising_inputs.steps, 0..) |*step_inputs, step_index| {
             const step_number = step_index + 1;
             const step_started: std.Io.Timestamp = .now(self.io, .awake);
-            log.info(
-                "Denoising step {d}/{d}{s}...",
-                .{
-                    step_number,
-                    denoising_inputs.steps.len,
-                    if (do_cfg) " (CFG: batched transformer)" else "",
-                },
-            );
 
             const next_latents = if (do_cfg) blk: {
                 self.runner.cfg_transformer.args.set(.{ latents, step_inputs.timestep });
@@ -1238,13 +1175,11 @@ pub const InferencePipeline = struct {
 
         var scaled_latent_slice = try latents.toSliceAlloc(self.allocator, self.io);
         defer scaled_latent_slice.free(self.allocator);
-        log.info("final latents before vae scaling: {}", .{computeSliceStats(scaled_latent_slice)});
         const scaling_factor = self.compiled_model.loaded_model.inner.vae.config.scaling_factor;
         const shift_factor = self.compiled_model.loaded_model.inner.vae.config.shift_factor;
         for (scaled_latent_slice.items(f32)) |*value| {
             value.* = (value.* / scaling_factor) + shift_factor;
         }
-        log.info("latents after vae scaling: {}", .{computeSliceStats(scaled_latent_slice)});
 
         var scaled_latents = try zml.Buffer.fromSlice(self.io, self.platform, scaled_latent_slice, .replicated);
         defer scaled_latents.deinit();
@@ -1254,7 +1189,6 @@ pub const InferencePipeline = struct {
 
         var image_buffer = self.runner.vae_decode.results.get(zml.Buffer);
         defer image_buffer.deinit();
-        try logBufferStats(self.allocator, self.io, "vae decoded image", image_buffer);
 
         var image_f32 = try bufferToF32(self.allocator, self.io, self.platform, image_buffer);
         defer if (image_f32.owned) image_f32.buffer.deinit();

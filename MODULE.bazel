@@ -5,7 +5,8 @@ bazel_dep(name = "zml")
 git_override(
     module_name = "zml",
     commit = "fdb6d5cd23c326e0493c71d594659b65646ba54d",
-    patch_cmds = ["""
+    patch_cmds = [
+        """
 patch -p1 <<'PATCH'
 --- a/third_party/com_google_sentencepiece/repo.bzl
 +++ b/third_party/com_google_sentencepiece/repo.bzl
@@ -38,7 +39,9 @@ patch -p1 <<'PATCH'
      ],
  )
 PATCH
-"""],
+""",
+        "sed -i.bak 's|https://codeberg.org/ziglang/translate-c|https://github.com/ziglang/translate-c|g' third_party/translate-c/repo.bzl",
+    ],
     remote = "https://github.com/zml/zml.git",
 )
 
