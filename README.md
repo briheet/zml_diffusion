@@ -58,10 +58,6 @@ nix run .#cudazimage -- \
   --output=/workspace/cinematic-cat-1024.png
 ```
 
-With a positive guidance scale, the positive and negative prompts run together
-as a batch of two in one transformer call. Prompt padding, attention masks, and
-per-prompt RoPE offsets follow the Diffusers Z-Image pipeline.
-
 ## Benchmark
 
 RTX 5090, 1024×1024, 48 steps; model loading excluded. Results are the mean of
@@ -72,8 +68,8 @@ four runs:
 | ZML | 35.012s |
 | Diffusers | 41.154s |
 
-ZML was **1.18× faster** on average. See the [raw results](results.md) and the
-[Diffusers benchmark](others/diffusers/zimage/README.md) for its command.
+ZML was **1.18× faster** on average. See the 
+[Diffusers benchmark](others/diffusers/zimage/README.md) for diffusers configuration.
 
 ## Development
 

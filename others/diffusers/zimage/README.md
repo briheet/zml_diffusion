@@ -19,13 +19,3 @@ uv run --python 3.12 main.py \
   --seqlen=512 \
   --output=/workspace/diffusers-cinematic-cat-1024.png
 ```
-
-The prompt, negative prompt, image dimensions, step count, guidance scale, and
-maximum sequence length intentionally match the root ZML command. The output
-prints CUDA-synchronized generation time, PNG save time, and total time.
-
-If an earlier install failed, remove its incomplete environment first:
-
-```bash
-rm -rf .venv /workspace/.cache/uv
-```
