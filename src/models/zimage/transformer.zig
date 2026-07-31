@@ -1201,13 +1201,36 @@ test "CFG inputs repeat latent and preserve prompt order" {
 }
 
 test "CFG output split removes the batch dimension" {
-    const output: zml.Tensor = .init(.{ .b = 2, .c = 16, .f = 1, .h = 128, .w = 128 }, .bf16);
-    const split = Transformer.splitCfgOutput(output);
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const platform = zml.testing.env();
 
-    try std.testing.expect(!split.positive.shape().hasTags(.{.b}));
-    try std.testing.expect(!split.negative.shape().hasTags(.{.b}));
-    try std.testing.expectEqual(@as(i64, 16), split.positive.dim(.c));
-    try std.testing.expectEqual(@as(i64, 16), split.negative.dim(.c));
+    const output: zml.Tensor = .init(.{ .b = 2, .c = 1, .f = 1, .h = 1, .w = 1 }, .f32);
+    const forward = struct {
+        fn forward(output_: zml.Tensor) Transformer.CfgOutput {
+            return Transformer.splitCfgOutput(output_);
+        }
+    }.forward;
+
+    var exe = try zml.module.compile(allocator, io, forward, .{output}, platform, .{});
+    defer exe.deinit();
+
+    var output_buffer = try zml.Buffer.fromBytes(io, platform, output.shape(), .replicated, std.mem.sliceAsBytes(&[_]f32{ 10, 20 }));
+    defer output_buffer.deinit();
+
+    var result = try zml.testing.autoCall(allocator, io, &exe, forward, .{output_buffer});
+    defer result.positive.deinit();
+    defer result.negative.deinit();
+
+    var positive = try result.positive.toSliceAlloc(allocator, io);
+    defer positive.free(allocator);
+    var negative = try result.negative.toSliceAlloc(allocator, io);
+    defer negative.free(allocator);
+
+    try std.testing.expect(!positive.shape.hasTags(.{.b}));
+    try std.testing.expect(!negative.shape.hasTags(.{.b}));
+    try std.testing.expectEqualSlices(f32, &.{10}, positive.constItems(f32));
+    try std.testing.expectEqualSlices(f32, &.{20}, negative.constItems(f32));
 }
 
 test "Diffusers prompt masks and image RoPE offsets vary per CFG item" {

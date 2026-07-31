@@ -5,8 +5,9 @@
 - RunPod image: `runpod/pytorch:1.0.7-cu1300-torch291-ubuntu2404-cluster`
 - Pod: `a9dk3g7cny`
 - GPU: 1× NVIDIA RTX 5090
-- CPU: 21 vCPUs (AMD EPYC 9354)
-- Memory: 125 GB
+- Driver: 580.159.03 (CUDA 13.0)
+- CPU: 76 vCPUs (AMD EPYC 9J14 96-Core Processor)
+- Memory: 150 GB
 - Container disk: 50 GB
 
 ## Install Nix on Ubuntu
@@ -63,14 +64,15 @@ per-prompt RoPE offsets follow the Diffusers Z-Image pipeline.
 
 ## Benchmark
 
-RTX 5090, 1024×1024, 48 steps; model loading excluded:
+RTX 5090, 1024×1024, 48 steps; model loading excluded. Results are the mean of
+four runs:
 
-| Implementation | Generation + PNG |
+| Implementation | Mean generation + PNG |
 |---|---:|
-| ZML | 35.091s |
-| Diffusers | 40.645s |
+| ZML | 35.012s |
+| Diffusers | 41.154s |
 
-ZML was **1.16× faster** in this run. See the
+ZML was **1.18× faster** on average. See the [raw results](results.md) and the
 [Diffusers benchmark](others/diffusers/zimage/README.md) for its command.
 
 ## Development
