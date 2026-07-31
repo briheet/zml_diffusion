@@ -358,6 +358,14 @@ pub const Transformer = struct {
         negative: zml.Tensor,
     };
 
+    fn splitCfgOutput(output: zml.Tensor) CfgOutput {
+        std.debug.assert(output.dim(.b) == 2);
+        return .{
+            .positive = output.slice1d(.b, .single(0)),
+            .negative = output.slice1d(.b, .single(1)),
+        };
+    }
+
     const CfgInputs = struct {
         latent: zml.Tensor,
         timestep: zml.Tensor,
@@ -416,10 +424,7 @@ pub const Transformer = struct {
             self.all_patch_size[0],
             self.all_f_patch_size[0],
         );
-        return .{
-            .positive = output.slice1d(.b, .single(0)).squeeze(.b),
-            .negative = output.slice1d(.b, .single(1)).squeeze(.b),
-        };
+        return splitCfgOutput(output);
     }
 };
 
@@ -1193,6 +1198,16 @@ test "CFG inputs repeat latent and preserve prompt order" {
     var aligned_length_slice = try result.prompt_aligned_length.toSliceAlloc(allocator, io);
     defer aligned_length_slice.free(allocator);
     try std.testing.expectEqualSlices(u32, &.{ 64, 32 }, aligned_length_slice.constItems(u32));
+}
+
+test "CFG output split removes the batch dimension" {
+    const output: zml.Tensor = .init(.{ .b = 2, .c = 16, .f = 1, .h = 128, .w = 128 }, .bf16);
+    const split = Transformer.splitCfgOutput(output);
+
+    try std.testing.expect(!split.positive.shape().hasTags(.{.b}));
+    try std.testing.expect(!split.negative.shape().hasTags(.{.b}));
+    try std.testing.expectEqual(@as(i64, 16), split.positive.dim(.c));
+    try std.testing.expectEqual(@as(i64, 16), split.negative.dim(.c));
 }
 
 test "Diffusers prompt masks and image RoPE offsets vary per CFG item" {
