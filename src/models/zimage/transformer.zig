@@ -468,7 +468,7 @@ pub const TimestepEmbedder = struct {
             .scale(-std.math.log(f32, std.math.e, max_period) / @as(f32, @floatFromInt(half)))
             .exp();
         const shape = zml.Shape.init(.{ .b = t.dim(.b), .f = half }, .f32);
-        const t_expanded = t.convert(.f32).insertAxes(.b, .{.f}).broad(shape);
+        const t_expanded = t.convert(.f32).insertAxes(.last, .{.f}).broad(shape);
         const freqs_expanded = freqs.insertAxes(.f, .{.b}).broad(shape);
         const args = t_expanded.mul(freqs_expanded);
         var embedding = zml.Tensor.concatenate(&.{ args.cos(), args.sin() }, -1);
