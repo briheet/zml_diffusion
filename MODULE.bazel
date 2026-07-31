@@ -86,6 +86,20 @@ PATCH
 )
 
 single_version_override(
+    module_name = "llvm",
+    patch_cmds = ["""
+patch -p1 <<'PATCH'
+--- a/http_bsdtar_archive.bzl
++++ b/http_bsdtar_archive.bzl
+@@ -170 +170 @@
+-    args = []
++    args = ["--no-same-owner"]
+PATCH
+"""],
+    version = "0.8.9",
+)
+
+single_version_override(
     module_name = "grpc",
     patch_cmds = [
         """
