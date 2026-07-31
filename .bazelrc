@@ -1,0 +1,7 @@
+common --copt=-w
+common --host_copt=-w
+common --incompatible_autoload_externally=+@rules_cc,+@rules_python,+@rules_shell,+@rules_java
+common --incompatible_disallow_empty_glob=false
+common --@rules_zig//zig/settings:use_cc_common_link=true
+common --@rules_zig//zig/settings:use_standalone_translate_c=true
+common --@rules_zig//zig/settings:zigopt=-fllvm

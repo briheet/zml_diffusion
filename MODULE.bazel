@@ -1,0 +1,141 @@
+module(name = "zml_diffusion")
+
+bazel_dep(name = "rules_zig", version = "0.15.1")
+bazel_dep(name = "zml")
+git_override(
+    module_name = "zml",
+    commit = "fdb6d5cd23c326e0493c71d594659b65646ba54d",
+    patch_cmds = ["""
+patch -p1 <<'PATCH'
+--- a/third_party/com_google_sentencepiece/repo.bzl
++++ b/third_party/com_google_sentencepiece/repo.bzl
+@@ -6,5 +6,10 @@
+         url = "https://github.com/google/sentencepiece/releases/download/v0.2.1/sentencepiece-0.2.1.tar.gz",
+         strip_prefix = "sentencepiece-0.2.1/sentencepiece",
+         sha256 = "8138cec27c2f2282f4a34d9a016e3374cd40e5c6e9cb335063db66a0a3b71fad",
++        patch_cmds = [
++            "find src -type f -name '*.cc' -exec sed -i.bak 's|third_party/absl/|absl/|g' {} +",
++            "find src -type f -name '*.h' -exec sed -i.bak 's|third_party/absl/|absl/|g' {} +",
++            "find src -name '*.bak' -delete",
++        ],
+         build_file = "//third_party/com_google_sentencepiece:sentencepiece.bazel",
+     )
+--- a/third_party/com_google_sentencepiece/sentencepiece.bazel
++++ b/third_party/com_google_sentencepiece/sentencepiece.bazel
+@@ -92,6 +92,13 @@
+         ":sentencepiece_cc_proto",
+         ":sentencepiece_model_cc_proto",
+         "@com_google_protobuf//:protobuf_lite",
+-        "@zml//third_party/com_google_sentencepiece:absl",
++        "@com_google_absl//absl/container:flat_hash_map",
++        "@com_google_absl//absl/container:flat_hash_set",
++        "@com_google_absl//absl/flags:flag",
++        "@com_google_absl//absl/flags:parse",
++        "@com_google_absl//absl/flags:usage",
++        "@com_google_absl//absl/strings",
++        "@com_google_absl//absl/strings:str_format",
++        "@com_google_absl//absl/strings:string_view",
+     ],
+ )
+PATCH
+"""],
+    remote = "https://github.com/zml/zml.git",
+)
+
+single_version_override(
+    module_name = "abseil-cpp",
+    patch_cmds = ["""
+patch -p1 <<'PATCH'
+--- a/absl/container/internal/raw_hash_set.h
++++ b/absl/container/internal/raw_hash_set.h
+@@ -229 +229 @@
+-#include <bmi2intrin.h>
++#include <immintrin.h>
+PATCH
+"""],
+    version = "20260526.0",
+)
+
+single_version_override(
+    module_name = "rules_distroless",
+    patch_cmds = ["""
+patch -p1 <<'PATCH'
+--- a/apt/private/version_constraint.bzl
++++ b/apt/private/version_constraint.bzl
+@@ -4,8 +4,16 @@
++_VERSION_CONSTRAINT_OPERATORS = ["<<", ">>", "<=", ">=", "="]
++
+ def _parse_version_constraint(rawv):
+-    vconst_i = rawv.find(" ")
+-    if vconst_i == -1:
+-        fail('invalid version string %s expected a version constraint ">=", "=", ">=", "<<", ">>"' % rawv)
+-    return (rawv[:vconst_i], rawv[vconst_i + 1:])
++    rawv = rawv.strip()
++    for op in _VERSION_CONSTRAINT_OPERATORS:
++        if rawv.startswith(op):
++            version = rawv[len(op):].strip()
++            if version:
++                return (op, version)
++
++            break
++
++    fail('invalid version string %s expected a version constraint ">=", "=", "<=", "<<", ">>"' % rawv)
+PATCH
+"""],
+    version = "0.8.0",
+)
+
+single_version_override(
+    module_name = "grpc",
+    patch_cmds = [
+        """
+patch -p1 <<'PATCH'
+--- a/bazel/grpc_build_system.bzl
++++ b/bazel/grpc_build_system.bzl
+@@ -34 +34,2 @@
+-load("@com_google_protobuf//bazel:upb_proto_library.bzl", "upb_proto_library", "upb_proto_reflection_library")
++load("@com_google_protobuf//bazel:upb_c_proto_library.bzl", upb_proto_library = "upb_c_proto_library")
++load("@com_google_protobuf//bazel:upb_proto_reflection_library.bzl", "upb_proto_reflection_library")
+PATCH
+""",
+        """
+patch -p1 <<'PATCH'
+--- a/BUILD
++++ b/BUILD
+@@ -1239 +1239 @@
+-    visibility = ["//bazel:grpc++_unsecure"],
++    visibility = ["//visibility:public"],
+PATCH
+""",
+    ],
+    version = "1.80.0",
+)
+
+single_version_override(
+    module_name = "envoy_api",
+    version = "0.0.0-20250128-4de3c74",
+)
+
+non_module_deps = use_extension(
+    "@zml//:third_party/non_module_deps.bzl",
+    "non_module_deps",
+)
+use_repo(
+    non_module_deps,
+    "arocc",
+    "cloud_accelerator_diagnostics",
+    "com_google_sentencepiece",
+    "flashattn_linux_amd64",
+    "flashattn_linux_arm64",
+    "iree",
+    "libvaxis",
+    "linenoise",
+    "mnist",
+    "mosaic_tpu",
+    "org_swig_swig",
+    "stb",
+    "translate-c",
+    "uucode",
+    "xla",
+    "zigimg",
+)

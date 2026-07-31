@@ -1,0 +1,11 @@
+load("@rules_zig//zig:defs.bzl", "zig_binary")
+
+zig_binary(
+    name = "zml_diffusion",
+    srcs = glob(["src/**/*.zig"]),
+    main = "src/main.zig",
+    deps = [
+        "@zigimg",
+        "@zml//zml",
+    ],
+)
