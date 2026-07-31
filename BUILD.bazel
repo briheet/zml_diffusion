@@ -1,4 +1,5 @@
 load("@rules_zig//zig:defs.bzl", "zig_binary")
+load("@rules_zig//zig/zls:zls_completion.bzl", "zls_completion")
 
 zig_binary(
     name = "zml_diffusion",
@@ -8,4 +9,9 @@ zig_binary(
         "@zigimg",
         "@zml//zml",
     ],
+)
+
+zls_completion(
+    name = "completion",
+    deps = [":zml_diffusion"],
 )

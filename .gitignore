@@ -3,3 +3,5 @@ bazel-*
 __pycache__/
 *.py[cod]
 .venv/
+*.png
+.zig-cache

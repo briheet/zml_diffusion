@@ -133,12 +133,30 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          bazelCommand = pkgs.writeShellApplication {
+            name = "bazel";
+            runtimeInputs = [ pkgs.bazelisk ];
+            text = ''
+              exec bazelisk "$@"
+            '';
+          };
+          bazelZls = pkgs.writeShellApplication {
+            name = "zls";
+            runtimeInputs = [ pkgs.bazelisk ];
+            text = ''
+              workspace="$(bazelisk info workspace)"
+              cd "$workspace"
+              exec bazelisk run -- //:completion "$@"
+            '';
+          };
         in
         {
           default = pkgs.mkShellNoCC {
             packages = with pkgs; [
               bazel-buildtools
+              bazelCommand
               bazelisk
+              bazelZls
               cacert
               gitMinimal
               gnupatch
@@ -147,7 +165,7 @@
             ];
 
             shellHook = ''
-              echo "Bazel $(cat .bazelversion) · Zig 0.16.0 (managed by ZML)"
+              echo "Bazel $(cat .bazelversion) · Zig 0.16.0 · ZML-aware ZLS"
             '';
           };
         }

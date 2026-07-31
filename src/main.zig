@@ -45,53 +45,6 @@ const Args = struct {
     ;
 };
 
-fn loadTensorRegistry(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    repo: std.Io.Dir,
-    files: models.RepositoryFiles,
-) !zml.safetensors.TensorRegistry {
-    var registry = zml.safetensors.TensorRegistry.init(allocator);
-    errdefer registry.deinit();
-
-    for (files.tensor_entrypoints) |path| {
-        const component_dir_path = std.fs.path.dirname(path) orelse ".";
-        const entrypoint_name = std.fs.path.basename(path);
-        const component_name = std.fs.path.dirname(path) orelse unreachable;
-
-        var component_repo = try repo.openDir(io, component_dir_path, .{});
-        defer component_repo.close(io);
-
-        const entrypoint = try component_repo.openFile(io, entrypoint_name, .{ .mode = .read_only });
-        defer entrypoint.close(io);
-
-        var component_registry = try zml.safetensors.fetchRegistry(
-            allocator,
-            io,
-            component_repo,
-            entrypoint,
-        );
-        defer component_registry.deinit();
-
-        try registry.mergeMetadata(component_registry.metadata);
-
-        var it = component_registry.iterator();
-        while (it.next()) |entry| {
-            const prefixed_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{
-                component_name,
-                entry.value_ptr.name,
-            });
-            defer allocator.free(prefixed_name);
-
-            var tensor = entry.value_ptr.*;
-            tensor.name = prefixed_name;
-            try registry.registerTensor(tensor);
-        }
-    }
-
-    return registry;
-}
-
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
 
@@ -227,4 +180,51 @@ pub fn printZmlLogo(io: std.Io) !void {
     var writer = std.Io.File.stdout().writerStreaming(io, &.{});
     try writer.interface.writeAll(LOGO);
     try writer.interface.flush();
+}
+
+fn loadTensorRegistry(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    repo: std.Io.Dir,
+    files: models.RepositoryFiles,
+) !zml.safetensors.TensorRegistry {
+    var registry = zml.safetensors.TensorRegistry.init(allocator);
+    errdefer registry.deinit();
+
+    for (files.tensor_entrypoints) |path| {
+        const component_dir_path = std.fs.path.dirname(path) orelse ".";
+        const entrypoint_name = std.fs.path.basename(path);
+        const component_name = std.fs.path.dirname(path) orelse unreachable;
+
+        var component_repo = try repo.openDir(io, component_dir_path, .{});
+        defer component_repo.close(io);
+
+        const entrypoint = try component_repo.openFile(io, entrypoint_name, .{ .mode = .read_only });
+        defer entrypoint.close(io);
+
+        var component_registry = try zml.safetensors.fetchRegistry(
+            allocator,
+            io,
+            component_repo,
+            entrypoint,
+        );
+        defer component_registry.deinit();
+
+        try registry.mergeMetadata(component_registry.metadata);
+
+        var it = component_registry.iterator();
+        while (it.next()) |entry| {
+            const prefixed_name = try std.fmt.allocPrint(allocator, "{s}.{s}", .{
+                component_name,
+                entry.value_ptr.name,
+            });
+            defer allocator.free(prefixed_name);
+
+            var tensor = entry.value_ptr.*;
+            tensor.name = prefixed_name;
+            try registry.registerTensor(tensor);
+        }
+    }
+
+    return registry;
 }

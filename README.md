@@ -67,3 +67,14 @@ RTX 5090, 1024×1024, 48 steps; model loading excluded:
 
 ZML was **1.16× faster** in this run. See the
 [Diffusers benchmark](others/diffusers/zimage/README.md) for its command.
+
+## Development
+
+```bash
+nix develop
+hx build.zig src/main.zig
+```
+
+The shell provides a Bazel-backed ZLS with navigation and completion for ZML.
+Opening `build.zig` primes ZLS's Bazel module map. The dependency remains in
+Bazel's external repository cache; it is not vendored.
